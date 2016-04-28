@@ -1,0 +1,379 @@
+---
+title: 'Advanced Linear Regression : Case Study Reviewed'
+author: 'MYU Data Science'
+date: 'By Jean Marie Cimula'
+output: html_document
+---
+
+###Problem description
+
+The 'Ozone' data from mlbench package contains the Los Angeles ozone pollution data collected in 1976. It is available as a data frame with 366 rows and 13 variables, that may be helpful to explain the ozone reading in the region. It is now up to us to find out which of the available variables would suit best to predict the ozone reading with maximum accuracy. The objective of this analysis is to accurately predict the 'daily maximum one-hour average ozone reading', using linear regression models.
+We will ensure this by making a 80:20 split of the data as development and validation samples, and use only the 80% sample for building linear models(training).
+
+The models thus built will be used to predict the ozone reading on the 20% validation sample. With the actual ozone readings from 20% validation sample and model predictions thus computed, we will calculate the prediction accuracy and use it as one of the important parameters to decide the optimal model that suits this problem.
+
+```{r results='hide', message=FALSE, warning=FALSE}
+#Loading libraries
+library(e1071)                  #Skewness
+library(PerformanceAnalytics)   #Correlogram (chart.Correlation)
+library(Hmisc)                  #Missing value treatement (impute)
+library(corrplot)               #Correlogram (corrplot)
+library(party)                  #Selecting best variables (cforest)
+library(Boruta)                 #Deciding if a variable is important (Boruta)
+library(caret)                  #Boxcox transformation (BoxCoxTrans)
+library(car)                    #VIF
+library(DMwR)                   #knnImputation
+library(mlbench)                #Ozone Data
+library(DAAG)                   #Cross validation
+library(relaimpo)               #Relative importance of predictors in lm mod
+```
+```{r message=FALSE, warning=FALSE}
+#Prepare input data
+###Create Input Datasets 
+
+data (Ozone, package="mlbench")  #Initialize the data
+inputData <- Ozone  #Data from mlbench
+#Assign names
+names(inputData) <- c("Month", "DayOfMonth", "DayOfWeek", "OzoneReading", "PressureHeight", "WindSpeed", "Humidity", "TemperatureSandburg", "TemperatureElMonte", "InversionBaseHeight", "PressureGradient", "InversionTemperature", "Visibility")
+
+#Segregate all continuous and categorical variables
+#Place all continuous vars in ipDataCnt
+ipDataCnt <- inputData[, c("PressureHeight", "WindSpeed", "Humidity", "TemperatureSandburg", "TemperatureElMonte", "InversionBaseHeight", "PressureGradient", "InversionTemperature", "Visibility")]
+
+#Place all categorical variables in ipDataCat
+ipDataCat <- inputData[, c("Month", "DayOfMonth", "DayOfWeek")]
+
+#Create the response data frame
+ipDataResponse <- data.frame(OzoneReading=inputData[, "OzoneReading"])
+respName <- "OzoneReading"  #name of response variable
+response <- inputData[, respName]  #response variable as a vector
+```
+
+###Exploratory analysis
+```{r message=FALSE, warning=FALSE}
+#Generate plots: Density, Scatter, Box plots
+#Set up your working directory here, to a location where you want to store plots.
+
+  for (k in names(ipDataCnt)){
+                   
+             x <- as.numeric (ipDataCnt[, k])
+             Skewness <- round(skewness(x), 2)  #calc skewness
+             dens <- density(x, na.rm=T)  #density func
+             par(mfrow=c(1, 3))  #setup plot-area in 3 columns
+             
+             #Density plot
+             plot(dens, type="l", col="red", ylab="Frequency", xlab = k, main = paste(k, ": Density Plot"),sub=paste("Skewness: ", Skewness))
+             polygon(dens, col="red")
+             
+             #Scatterplot
+             plot(x, response, col="blue", ylab="Response", xlab = k, main = paste(k, ": Scatterplot"), pch=20)
+             abline(response ~ x)
+             boxplot(x, main=paste(k, ": Box Plot"), sub=paste("Outliers: ", paste(boxplot.stats(x)$out, collapse=" ")))
+}
+```
+###Oultier analysis
+```{r message=FALSE, warning=FALSE}
+#Method 1: If you choose to remove the outliers (not recommended)
+x <- x[!x %in% boxplot.stats(x)$out]  # NOT run!
+
+#Method 2: Replace outliers with NAs, be be filled up later during missing value treatment.
+
+repOutlierMissing <- function(x, na.rm = TRUE, ...){
+  
+                      qnt <- quantile(x, probs=c(.25, .75), na.rm = na.rm, ...)
+                      H <- 1.5 * IQR(x, na.rm = na.rm)  #Threshold
+                      y <- x
+                      y[x < (qnt[1] - H)] <- NA  
+                      y[x > (qnt[2] + H)] <- NA
+                      return(y)
+                  }
+ipDataCnt <- as.data.frame (sapply(ipDataCnt, repOutlierMissing))  #this will make outliers as NA 
+
+#Re-assemble inputdata with the outlier corrected part
+inputData <- cbind(ipDataResponse, ipDataCnt, ipDataCat)  #column bind the response, continuous and categorical predictors
+
+```
+###Missing value treatment
+
+Approaches for handling missing values.
+(1) Eliminating the variable: If a particular variable has more than 30% missing values, it is advisable to consider removing that variable altogether.
+(2) Eliminating the observations: If there are missing values scattered through out your dataset and you have a good number of observations in your sample, you may choose to eliminate those observations with missing values. After doing this, if you find losing more than 30% of sample size, then you probably need to look for any particular variable that is contributing the most number of missing values.
+(3) Imputation: Alternatively, you may also impute the missing values with one of these place holders.
+
+```{r message=FALSE, warning=FALSE}
+#Apply the missing value treatment
+#Method 1: Replace missing values with mean (NOT Run)
+ipDataCntMatrix <- sapply(ipDataCnt, FUN=function(x){impute(x, mean)})#Missing values with the mean using 'impute' func from 'Hmisc' pkg
+
+ipDataCnt <- as.data.frame(ipDataCntMatrix)  #store as dataframe
+
+#Method 2: k-Nearest neighbor imputation method - Applied!
+# Impute all except the response variable.
+
+if( anyNA(inputData)) {
+              # missing value treatment
+              inputData[, !names(inputData) %in% respName] <- knnImputation(inputData[, !names(inputData) %in% respName])  
+}
+```
+
+###Correlation analysis and Summary
+
+The correlogram is a graphical representation of correlation amongst all combinations of response and predictor variables. The investigator may choose to pick variables that have high correlation with the response based on a pre-determined cutoff. But we do not do that filtering here, since it is possible that a variable with relatively lower correlation can prove significant and valuable in regression models to capture unexplained variations, even if they are of 'lower' importance.
+
+```{r message=FALSE, warning=FALSE}
+par (mfrow=c(1,1))
+ipDataRespCntNALess <- na.omit(cbind(ipDataResponse, ipDataCnt))  #remove rows with missing values
+chart.Correlation(ipDataRespCntNALess, histogram=TRUE, pch=19)  #plot correlogram
+corrplot(cor(ipDataRespCntNALess), method="circle", is.corr=TRUE)
+
+#Get and store the summary files
+sapply(inputData, summary)  #get summary statistics for all columns
+```
+
+###Box Cox Transformation for Continuous variables
+
+Upon performing outlier treatment, you can expect the skewness of the variable to improve. But not always. Sometimes a box-cox transformation of the response variable is preferable to reduce the skewness and make it closer to a normal distribution. While the variable gets transformed, ranking order of the variable remains the same after the transformation.
+
+###Why does a highly skewed non-normal response variable matter?
+
+Because, for the long tailed region of the response, there is a larger variance. This also means, more predictors are expected to have a stronger effect while explaining the larger variance part of the response variable, thereby creating a bias. This can affect all the estimates resulting in spurious models. It can also be argued that a high skewness is a consequence of heteroscedasticity (non-constant variance).
+
+Therefore, if the skewness does not improve after treating the outliers, consider performing a box-cox transformation especially when k-fold cross-validation reveals inconsistent results. Note that, it is not mandatory to apply box-cox transformation on all variables that are skewed. It is up to the best judgement of the investigator to decide if box-cox transformation is indeed needed on a variable.
+
+Nevertheless, just so you know how a box cox transform is done, below is the procedure. As a default, box-cox transformation in the response variable is sufficient, but here, I have chosen to apply it on variables that have a skewness > 1, even after outlier corrections are applied.
+
+```{r message=FALSE, warning=FALSE}
+skewness(ipDataResponse, na.rm=T)  # 0.878864
+
+#Transforming the predictor variables
+
+boxcoxTransformedVars <- character(0)  #variables that underwent box-cox transformation collects here.
+       
+ for (colname in colnames(ipDataCnt[, -1])) {
+                   
+                     x <- ipDataCnt[, colname]
+                     #Check for high skewness.
+                     if(abs(skewness(x, na.rm=T)) > 1){  
+                                 
+                                      boxcoxMod <- BoxCoxTrans(x) #calculates lambda value and store in a model
+                                      boxcoxTransformedVars <<- c(boxcoxTransformedVars, colname)
+                                      ipDataCnt[, colname] <- predict(boxcoxMod, x)  #calculate transformed variable
+                      }
+
+ } 
+#Selecting signifiant variables (continuous) - checking for p-Values
+
+sigPredCnt <- character()  #initialise output. Significant preds will accrue here
+
+for (predName in names(ipDataCnt)) {
+
+           pred <- inputData[, predName]
+           mod <- lm(response ~ pred)  #build linear model with only current predictor
+           p_value <- summary(mod)$coefficients[, 4][2]  # capture p-Value
+                  #check for significance
+                  if (p_value < 0.1 & p_value > 0) {  
+                             #if selected, bind the predictor name if main output
+                             sigPredCnt <- c (sigPredCnt, predName)
+
+                  }
+
+}
+
+ipDataCntSig <- inputData[, names(inputData) %in% sigPredCnt]  #filter selected predictors
+
+#Selecting signifiant variables (categorical) - checking for chi-sq test
+
+sigPredCat <- character()  #initialise output. Significant preds will accrue here
+
+for (predName in names(ipDataCat)) {
+
+              pred <- inputData[, predName]
+              chi_sq <- invisible(suppressWarnings(chisq.test(table(response, pred))))  #perform chi-Squared tes
+              p_value <- chi_sq[3]  #capture p-Value
+                         #check for significance
+                         if (p_value < 0.1 & p_value > 0) {  
+                                  
+                                     sigPredCat <- c (sigPredCat, predName)
+                          }
+
+}
+
+ipDataCatSig <- as.data.frame(inputData[, names(inputData) %in% sigPredCat])
+colnames(ipDataCatSig) <- sigPredCat  #assign column names
+
+#Combine the response, continuous significant predictors, categorical significant predictors
+inputDataSigF <- cbind(response, ipDataCntSig, ipDataCatSig)
+```
+
+###Feature selection
+```{r message=FALSE, warning=FALSE}
+#Part 1: Boruta: Decide if a variable is important or not
+# Decide if a variable is important or not using Boruta
+
+borutaOutput <- Boruta(response ~ ., data=na.omit(inputDataSigF), doTrace=2)  #perform Boruta search
+borutaSigF <- names(borutaOutput$finalDecision[borutaOutput$finalDecision %in% c("Confirmed", "Tentative")])  #collect Confirmed and Tentative variables
+
+#Part 2: Estimate important variables based on mean drop in accuracy - using cforest
+#Selecting best variables (variable selection using cforest)
+
+cf1 <- cforest(response ~ . , data= na.omit(inputDataSigF[, names(inputDataSigF) %in% c(borutaSigF, "response")]), control=cforest_unbiased(mtry=2,ntree=50)) #fit the random forest
+impVars <- sort(varimp(cf1), decreasing=T) #get variable importance
+
+# Pick top 7. Adjust this as per your needs. More variables will take more computational time.
+
+impVars <- if(length(impVars) > 7){  impVars[1:7] } else { impVars}
+
+#Part 3: Removing multicollinearity
+varConsFilter <- names(impVars)[!names(impVars) %in% names(ipDataCatSig)]  #exclude categoricals
+fullForm <- (paste ("response ~ ", paste (varConsFilter, collapse=" + "), sep=""))  #model formula
+fullMod  <- lm(as.formula(fullForm), data=inputDataSigF)  #build linear model
+
+allVIF <- try(vif(fullMod), silent=TRUE)  #get all vifs
+
+#if vif of any of the variables in model is greater than threshold (4), drop the max VIF variable and build model again, until all variables have VIF less than threshold.
+
+    if(class(allVIF) != "try-error"){
+                                
+                         allVIF <- as.data.frame(allVIF)  #cast as a dataframe
+                         # check if there are more > 2 rows, max-VIF exceeds 4 and not of 'try-error' clas
+                         
+                         while((nrow(allVIF) > 2)& (max(allVIF[, 1]) > 4)  &  (class(allVIF) != "try-error")) {
+                                      #find max VIF variable
+                                      rmVars <- rownames(allVIF)[which(allVIF[, 1] == max(allVIF[, 1]))] 
+                                      impVars <- impVars[!names(impVars) %in% rmVars]  #remove
+                                      fullForm <- paste ("response ~ ", paste (names(impVars), collapse=" + "), sep="")  #new formula
+                                      fullMod <- lm(as.formula(fullForm), data=inputDataSigF)  #re-build model with new formula
+                                      allVIF <- try(as.data.frame(vif(fullMod)), silent=TRUE)  # get all vifs
+
+                        }
+}
+
+vFilterVars <- names(fullMod$model)[!names(fullMod$model) %in% "response"]
+```
+
+###Create all combinations of selected variables that will go into models as predictors
+
+Lets build all combinations of the selected predictor variables, for building models of all sizes. If you wish to limit the maximum size the model, set the size in maxModelSize variable.
+
+```{r message=FALSE, warning=FALSE}
+#create all combinations of predictors
+
+maxModelSize <- length(vFilterVars)
+
+cmbMatrix <- matrix(ncol=maxModelSize)  #initialise final output
+
+for (n in 1:length(vFilterVars)){
+
+              cmbMatFilter <- t(combn(vFilterVars, n))  #all combinations of variable
+              nrOut <- nrow(cmbMatFilter)
+              ncOut <- length(vFilterVars)
+              nrNA  <- nrOut
+              ncNA  <- ncOut-ncol(cmbMatFilter)
+              naMatr<- matrix(rep(NA, nrNA*ncNA), nrow=nrNA, ncol=ncNA)
+              out   <- cbind(cmbMatFilter, naMatr)
+              cmbMatrix <- rbind(cmbMatrix, out)
+}
+
+cmbMatrix <- cmbMatrix[-1, ]  #remove the first row that has all NA
+
+## Split training and test data (development and validation)
+
+set.seed(100)
+trainingIndex <- sample(1:nrow(inputDataSigF), 0.8*nrow(inputDataSigF))  #random sample rows for training data
+inputDataSigFTrain <- na.omit(inputDataSigF[trainingIndex, ])  #remove NA's in response variable
+inputDataSigFTesting <- na.omit(inputDataSigF[-trainingIndex, ])  #omitting NA's, since we need to calculate prediction accuracy
+```
+
+###Building all the linear models and diagnostics
+
+Now that we have all the possible combinations for predictors, we can expect to generate several good models from this mix. In the code that follows, you will first build the model and capture the summary of the model in a variable (currSumm). Then, the diagnostic parameters such as R-sq, p-Value, AIC etc are captured.
+Post that, the Influential observations and accuracy measures are calculated on the training and test data sets. Finally, we perform the k-Fold cross validation and capture the mean-squared error for the model. 
+
+```{r results='hide'}
+
+#BUILD THE LINEAR MODELS
+
+Final_Output <- data.frame()  #initialise the final output dataframe
+par (mfrow=c(1,3))  #set margins
+
+for (rownum in 1:nrow(cmbMatrix)){
+            ##Build model for current formula from cmbMatrix
+            preds <- na.omit(cmbMatrix[rownum, ])  #get the predictor names
+            form <- paste ("response ~ ", paste (preds, collapse=" + "), sep="")  #model formul
+            currMod <- lm(as.formula(form), data=inputDataSigFTrain)  #build the linear model
+            currSumm <- summary(currMod)  #model summary
+            
+            ##Diagnostic parameters-
+            FStats <- currSumm$fstatistic[1]  #Fstatistic
+            f <- currSumm$fstatistic  #parameters for model p-value calc
+            modelP <- pf(f[1], f[2], f[3], lower=FALSE)  #model p-Value
+            rSQ  <- currSumm[8]  #R-Squared
+            ArSQ <- currSumm[9]  #adj R-Squared
+            aic  <- AIC(currMod)  #AIC
+            bic  <- BIC(currMod)  #BIC
+            
+            ## Get Influential Observations-
+            cutoff <- 4/(nrow(inputDataSigFTrain)-length(currMod$coefficients)-2)  #cooks.distance cutoff
+            infObsRows <- paste(which(cooks.distance(currMod) > cutoff), collapse=" ")  #caputure influential observations 
+            
+            ## Calculate accuracy measures on Development sample-
+            trainMap  <- mean((abs(currMod$residuals))/abs(na.omit(inputDataSigFTrain$response))) * 100  #MAPE
+            actFitted <- data.frame(actuals=inputDataSigFTrain$response, fitted=currMod$fitted)
+            minVals   <- apply(actFitted, 1, min)
+            maxVals   <- apply(actFitted, 1, max)
+            trainMinMax <- minVals/maxVals
+            trainMinMaxAcc <- mean(trainMinMax)
+            
+            ## Calculate accuracy measures on Validation sample-
+            predicteds <- predict(currMod, inputDataSigFTesting)  #predict for test data
+            predMap    <- mean((abs(inputDataSigFTesting$response - predicteds)/abs(inputDataSigFTesting$response))) * 100  #calculate predicted mape  
+            actual_predicteds <- data.frame(actuals=inputDataSigFTesting$response, predicted=predicteds)
+            minVals <- apply(actual_predicteds, 1, min)
+            maxVals <- apply(actual_predicteds, 1, max)
+            predMinMax <- minVals/maxVals
+            predMinMaxAcc <- mean(minVals/maxVals) #min-max accuracy on test data
+
+            ##Perform k-Fold cross-validation-
+            cvResults <- suppressWarnings(CVlm(na.omit(inputDataSigF), form.lm=currMod, m=5, dots=FALSE, seed=29, legend.pos="topleft", printit=FALSE))
+            meanSQError <- attr(cvResults, 'ms')
+
+            ##Collect all stats for Final Output-
+            currOutput <- data.frame(formula=form, rSQ=rSQ, ArSQ=ArSQ, AIC=aic, BIC=bic, Model.pValue= modelP,
+                          F.Statistic=f[1], training.mape=trainMap, predicted.mape=predMap, training.minmax.accuracy = trainMinMaxAcc, predicted.minmax.accuracy=predMinMaxAcc, influential.obs = infObsRows, k_fold_ms=meanSQError)
+            
+            #Final Output
+            Final_Output <- rbind(Final_Output, currOutput)
+            
+            ##Print output so they get accumulated in 'All_Models_In_Combos.txt'
+            names(actFitted) <- c("actuals", "predicted")
+            actPredAll <- rbind(actFitted, actual_predicteds)
+            print (currSumm)
+            print (vif(currMod))
+            print (actpPred <- cbind(actPredAll, na.omit(inputDataSigF)[, preds]))
+}
+
+write.csv(Final_Output, "Final_Regression_Output.csv", row.names=F)  # Export
+```
+
+
+Final_Regression_Output is the final output file containing diagnostic parameters for all models. In below table, you will find a sample row of 'Final_Regression_Output for one of the models, that we just built using the above logic
+
+
+```{r}
+rownum=13  #row number of best model from Final_Regression_Output.csv
+
+preds <- na.omit(cmbMatrix[rownum, ])  #get the predictor names
+form  <- paste ("response ~ ", paste (preds, collapse=" + "), sep="")  #model fornula
+currMod <- lm(as.formula(form), data=inputDataSigFTrain)  #build llinear model
+currSumm <- summary(currMod)  #model summary
+vif(currMod)  #variance inflation factor
+```
+
+#Get influential observations
+```{r}
+#Get Influential Observations
+cutoff <- 4/(nrow(inputDataSigFTrain)-length(currMod$coefficients)-2)
+plot (currMod, which=4, cook.levels=cutoff)
+abline (h=cutoff, lty=2, col="red")
+influencePlot (currMod)  #Influence plot for best model fits
+```
